@@ -1,4 +1,36 @@
 #!/usr/bin/env python3
+"""
+cmd_vel_to_actuator_motors_turn_priority.py
+
+Raspberry Pi side bridge:
+  /cmd_vel Twist(linear.x=v [m/s], angular.z=omega [rad/s])
+      -> PX4 ActuatorMotors normalized left/right commands.
+
+This version uses the calibrated real-world max speed/yaw-rate:
+
+  v_real_max:
+      real forward speed when actuator left=+1, right=+1
+
+  omega_real_max:
+      real yaw rate when actuator left=-1, right=+1 or left=+1, right=-1
+
+Mapping:
+
+  forward = v / v_real_max
+  turn    = omega / omega_real_max
+
+  left  = forward - turn
+  right = forward + turn
+
+Important saturation policy:
+  If abs(forward) + abs(turn) exceeds motor_total_max,
+  keep turn first and reduce forward.
+
+Reason:
+  For obstacle avoidance / CBF, turning authority is usually more safety-critical
+  than forward speed. When commands are physically infeasible, the rover should
+  slow down rather than lose turning ability.
+"""
 
 import math
 import time
@@ -24,37 +56,64 @@ class CmdVelToActuatorMotors(Node):
     def __init__(self):
         super().__init__("cmd_vel_to_actuator_motors")
 
+        # -------------------------
         # Topics
+        # -------------------------
         self.declare_parameter("cmd_vel_topic", "/cmd_vel")
         self.declare_parameter("offboard_topic", "/px4_1/fmu/in/offboard_control_mode")
         self.declare_parameter("motor_topic", "/px4_1/fmu/in/actuator_motors")
         self.declare_parameter("vehicle_command_topic", "/px4_1/fmu/in/vehicle_command")
 
-        # cmd_vel 输入上限，需要和 laptop controller 保持一致
-        self.declare_parameter("v_input_max", 0.1)   # m/s
-        self.declare_parameter("w_input_max", 0.8)   # rad/s
+        # -------------------------
+        # Calibration constants
+        # -------------------------
+        # These are physical actuator norm=1 limits measured by Vicon.
+        # They are NOT the controller's desired v_max / w_max.
+        #
+        # From your latest max-actuator calibration:
+        #   forward_max:    about 1.26 m/s
+        #   spin max:       conservative about 2.96 rad/s
+        #
+        # Rounded defaults:
+        self.declare_parameter("v_real_max", 1.25)       # m/s
+        self.declare_parameter("omega_real_max", 3.00)   # rad/s
 
-        # 输出到 ActuatorMotors 的最大幅度，先保守一点
-        self.declare_parameter("motor_forward_max", 0.16)
-        self.declare_parameter("motor_turn_max", 0.45)
-        self.declare_parameter("motor_total_max", 0.5)
+        # -------------------------
+        # Safety limits
+        # -------------------------
+        # For the FIRST test after changing this bridge, keep this at 0.60.
+        # After confirming direction and behavior, you may change it to 1.00.
+        self.declare_parameter("motor_total_max", 1.00)
 
-        # 如果左右反了 / 转向反了，可以改这些
+        # Optional global scaling after turn-priority limiting.
+        # Usually keep 1.0. Set 0.5 if you want to make everything extra gentle.
+        self.declare_parameter("output_scale", 1.00)
+
+        # -------------------------
+        # Direction fixes
+        # -------------------------
+        # Use these if the rover turns the wrong way or left/right are swapped.
         self.declare_parameter("swap_left_right", False)
         self.declare_parameter("invert_left", False)
         self.declare_parameter("invert_right", False)
         self.declare_parameter("invert_angular", False)
 
-        # 如果多久没收到 cmd_vel，就停
+        # If no cmd_vel arrives for this long, stop.
         self.declare_parameter("cmd_timeout", 0.30)
 
+        # -------------------------
+        # Read parameters
+        # -------------------------
         self.cmd_vel_topic = self.get_parameter("cmd_vel_topic").value
-        self.v_input_max = float(self.get_parameter("v_input_max").value)
-        self.w_input_max = float(self.get_parameter("w_input_max").value)
 
-        self.motor_forward_max = float(self.get_parameter("motor_forward_max").value)
-        self.motor_turn_max = float(self.get_parameter("motor_turn_max").value)
+        self.v_real_max = float(self.get_parameter("v_real_max").value)
+        self.omega_real_max = float(self.get_parameter("omega_real_max").value)
+
         self.motor_total_max = float(self.get_parameter("motor_total_max").value)
+        self.output_scale = float(self.get_parameter("output_scale").value)
+
+        self.motor_total_max = clamp(abs(self.motor_total_max), 0.0, 1.0)
+        self.output_scale = clamp(abs(self.output_scale), 0.0, 1.0)
 
         self.swap_left_right = bool(self.get_parameter("swap_left_right").value)
         self.invert_left = bool(self.get_parameter("invert_left").value)
@@ -63,6 +122,9 @@ class CmdVelToActuatorMotors(Node):
 
         self.cmd_timeout = float(self.get_parameter("cmd_timeout").value)
 
+        # -------------------------
+        # State
+        # -------------------------
         self.latest_v = 0.0
         self.latest_w = 0.0
         self.last_cmd_time = 0.0
@@ -72,6 +134,11 @@ class CmdVelToActuatorMotors(Node):
         self.offboard_requested = False
         self.armed_requested = False
 
+        self.last_map_info = "init"
+
+        # -------------------------
+        # ROS interfaces
+        # -------------------------
         self.sub = self.create_subscription(
             Twist,
             self.cmd_vel_topic,
@@ -100,12 +167,18 @@ class CmdVelToActuatorMotors(Node):
         # 50 Hz loop
         self.timer = self.create_timer(0.02, self.loop)
 
-        self.get_logger().info("cmd_vel -> actuator_motors bridge started.")
+        self.get_logger().info("turn-priority calibrated cmd_vel -> actuator_motors bridge started.")
         self.get_logger().info(f"Subscribing: {self.cmd_vel_topic}")
         self.get_logger().info(
-            f"motor_forward_max={self.motor_forward_max}, "
-            f"motor_turn_max={self.motor_turn_max}, "
-            f"motor_total_max={self.motor_total_max}"
+            f"v_real_max={self.v_real_max:.3f} m/s, "
+            f"omega_real_max={self.omega_real_max:.3f} rad/s, "
+            f"motor_total_max={self.motor_total_max:.3f}, "
+            f"output_scale={self.output_scale:.3f}"
+        )
+        self.get_logger().info(
+            f"direction options: swap_left_right={self.swap_left_right}, "
+            f"invert_left={self.invert_left}, invert_right={self.invert_right}, "
+            f"invert_angular={self.invert_angular}"
         )
 
     def ts(self):
@@ -156,27 +229,71 @@ class CmdVelToActuatorMotors(Node):
 
         self.motor_pub.publish(msg)
 
-    def cmd_vel_to_left_right(self, v, w):
+    def twist_to_forward_turn(self, v, w):
+        """
+        Convert cmd_vel into normalized forward/turn components.
+        """
         if self.invert_angular:
             w = -w
 
-        # 先不直接用 wheel_base 物理模型，因为 actuator_motors 不是 m/s。
-        # 这里做工程归一化：
-        # v = v_input_max -> forward component = motor_forward_max
-        # w = w_input_max -> turn component = motor_turn_max
-        v_norm = clamp(v / self.v_input_max, -1.0, 1.0) if self.v_input_max > 1e-6 else 0.0
-        w_norm = clamp(w / self.w_input_max, -1.0, 1.0) if self.w_input_max > 1e-6 else 0.0
+        if self.v_real_max > 1.0e-6:
+            forward = v / self.v_real_max
+        else:
+            forward = 0.0
 
-        forward = v_norm * self.motor_forward_max
-        turn = w_norm * self.motor_turn_max
+        if self.omega_real_max > 1.0e-6:
+            turn = w / self.omega_real_max
+        else:
+            turn = 0.0
 
-        # ROS convention:
-        # angular.z > 0 means turn left.
-        # differential convention:
-        # left slower/backward, right faster/forward.
+        # Safety clamp individual components before combined limiting.
+        # This prevents absurd commands from producing absurd intermediate values.
+        forward = clamp(forward, -1.0, 1.0)
+        turn = clamp(turn, -1.0, 1.0)
+
+        return forward, turn
+
+    def apply_turn_priority_limit(self, forward, turn):
+        """
+        Enforce actuator feasibility while preserving turning authority first.
+
+        For left = forward - turn, right = forward + turn,
+        the necessary/sufficient condition for both wheels within +/-limit is:
+
+            abs(forward) + abs(turn) <= limit
+
+        If the command violates this, keep turn and reduce forward.
+
+        If turn alone exceeds limit, clamp turn and set forward to zero.
+        """
+        limit = self.motor_total_max
+
+        # Clamp turn first because turn has priority.
+        turn_limited = clamp(turn, -limit, limit)
+
+        # Whatever remains can be used for forward.
+        allowed_forward = limit - abs(turn_limited)
+
+        if allowed_forward <= 1.0e-9:
+            forward_limited = 0.0
+        else:
+            forward_limited = math.copysign(
+                min(abs(forward), allowed_forward),
+                forward,
+            )
+
+        # Optional global output scale after feasibility limiting.
+        forward_limited *= self.output_scale
+        turn_limited *= self.output_scale
+
+        return forward_limited, turn_limited
+
+    def forward_turn_to_left_right(self, forward, turn):
         left = forward - turn
         right = forward + turn
+        return left, right
 
+    def apply_direction_options(self, left, right):
         if self.swap_left_right:
             left, right = right, left
 
@@ -185,15 +302,38 @@ class CmdVelToActuatorMotors(Node):
         if self.invert_right:
             right = -right
 
+        return left, right
+
+    def cmd_vel_to_left_right(self, v, w):
+        raw_forward, raw_turn = self.twist_to_forward_turn(v, w)
+
+        limited_forward, limited_turn = self.apply_turn_priority_limit(
+            raw_forward,
+            raw_turn,
+        )
+
+        left, right = self.forward_turn_to_left_right(
+            limited_forward,
+            limited_turn,
+        )
+
+        left, right = self.apply_direction_options(left, right)
+
+        # Final hard safety clamp after direction options.
         left = clamp(left, -self.motor_total_max, self.motor_total_max)
         right = clamp(right, -self.motor_total_max, self.motor_total_max)
+
+        self.last_map_info = (
+            f"raw_forward={raw_forward:+.3f}, raw_turn={raw_turn:+.3f}, "
+            f"limited_forward={limited_forward:+.3f}, limited_turn={limited_turn:+.3f}"
+        )
 
         return left, right
 
     def loop(self):
         self.publish_offboard_mode()
 
-        # 前 2 秒只发 0，给 PX4 offboard setpoint 预热
+        # First 2 seconds: publish zero setpoints to warm up PX4 offboard.
         if self.count < 100:
             self.publish_motors(0.0, 0.0)
             self.count += 1
@@ -212,6 +352,7 @@ class CmdVelToActuatorMotors(Node):
         # cmd timeout safety
         if (not self.have_cmd) or (time.time() - self.last_cmd_time > self.cmd_timeout):
             left, right = 0.0, 0.0
+            self.last_map_info = "timeout_or_no_cmd"
         else:
             left, right = self.cmd_vel_to_left_right(self.latest_v, self.latest_w)
 
@@ -219,7 +360,7 @@ class CmdVelToActuatorMotors(Node):
 
         self.get_logger().info(
             f"cmd_vel v={self.latest_v:.3f}, w={self.latest_w:.3f} -> "
-            f"motors left={left:.3f}, right={right:.3f}",
+            f"motors left={left:+.3f}, right={right:+.3f} | {self.last_map_info}",
             throttle_duration_sec=0.5,
         )
 

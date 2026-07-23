@@ -76,7 +76,7 @@ class CmdVelToActuatorMotors(Node):
         #
         # Rounded defaults:
         self.declare_parameter("v_real_max", 1.25)       # m/s
-        self.declare_parameter("omega_real_max", 3.00)   # rad/s
+        self.declare_parameter("omega_real_max", 3.35)   # rad/s
 
         # -------------------------
         # Safety limits

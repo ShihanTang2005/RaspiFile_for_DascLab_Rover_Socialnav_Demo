@@ -1,0 +1,12 @@
+/**:
+  ros__parameters:
+    cmd_vel_topic: /roverpi3/cmd_vel
+    offboard_topic: /roverpi3/fmu/in/offboard_control_mode
+    motor_topic: /roverpi3/fmu/in/actuator_motors
+    vehicle_command_topic: /roverpi3/fmu/in/vehicle_command
+    cmd_timeout: 0.30
+# TODO: the offboard topic, motor topic, and vehicle command topic may use another namespace, depending on the PX4 setup.
+
+# this is an example of roverpi3.yaml file. Change your number to match your rover.
+# put in the python scripts' back: 
+# --ros-args --params-file /root/scripts/config/roverpi3.yaml
